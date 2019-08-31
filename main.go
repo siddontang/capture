@@ -10,14 +10,15 @@
 package main
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +36,10 @@ import (
 
 var iface = flag.String("i", "eth0", "Interface to get packets from")
 var fname = flag.String("r", "", "Filename to read from, overrides -i")
-var snaplen = flag.Int("s", 4096, "SnapLen for pcap packet capture")
+var snaplen = flag.Int("s", 65536, "SnapLen for pcap packet capture")
 var filter = flag.String("f", "tcp and dst port 80", "BPF filter for pcap")
 var logAllPackets = flag.Bool("v", false, "Logs every packet in great detail")
+var pprofAddr = flag.String("a", "127.0.0.1:6060", "Pprof address")
 
 // Build a simple HTTP request parser using tcpassembly.StreamFactory and tcpassembly.Stream interfaces
 
@@ -105,6 +107,24 @@ var readNum int64
 var streamPath = map[string]map[uint32]string{}
 var pathLock sync.RWMutex
 
+func checkSlow(reason string, net string) chan struct{}{
+	ch := make(chan struct{})
+	go func() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ch:
+			return 
+		case <-t.C:
+			log.Printf("failed to %s data at %s", reason, net)
+		}
+	}
+	}()
+	return ch
+}
+
 func (h *httpStream) run() {
 	buf := bufio.NewReader(&h.r)
 	framer := http2.NewFramer(ioutil.Discard, buf)
@@ -122,8 +142,11 @@ func (h *httpStream) run() {
 		delete(streamPath, revNet)
 		pathLock.Unlock()
 	}()
+	var ch chan struct{}
 	for {
+		ch = checkSlow("peek", net)
 		peekBuf, err := buf.Peek(9)
+		close(ch)
 		if err == io.EOF {
 			return
 		} else if err != nil {
@@ -146,7 +169,9 @@ func (h *httpStream) run() {
 			buf.Discard(len(connPreface))
 		}
 
+		ch = checkSlow("read", net)
 		frame, err := framer.ReadFrame()
+		close(ch)
 		if err == io.EOF {
 			return
 		}
@@ -194,7 +219,7 @@ func (h *httpStream) run() {
 			if !ok {
 				dataBuf = bytes.Buffer{}
 				dataBufs[id] = dataBuf
-			}	
+			}
 			dumpMsg(&dataBuf, net, path, frame, streamSide[id])
 		default:
 		}
@@ -203,6 +228,10 @@ func (h *httpStream) run() {
 
 func main() {
 	defer util.Run()()
+	go func() {
+		http.ListenAndServe(*pprofAddr, nil)
+	}()
+
 	var handle *pcap.Handle
 	var err error
 
